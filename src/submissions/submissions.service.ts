@@ -2,12 +2,12 @@ import { Injectable } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { Submission, SubmissionData } from './submission.entity';
 import { Upload, UploadData } from './upload.entity';
+import { Bay, BayData } from './bay.entity';
 import { v4 as uuidv4 } from 'uuid';
 import { User } from '../users/entities/user.entity';
 import { Store } from '../store/store.entity';
 import { Planogram } from '../planogram/planogram.entity';
 import { StorageService } from '../storage/storage.service';
-import { equal } from 'assert';
 
 @Injectable()
 export class SubmissionsService {
@@ -19,6 +19,8 @@ export class SubmissionsService {
     Submission.setTableName('submissions');
     Upload.setDatabaseService(this.databaseService);
     Upload.setTableName('uploads');
+    Bay.setDatabaseService(this.databaseService);
+    Bay.setTableName('bays');
     User.setDatabaseService(this.databaseService);
     User.setTableName('users');
     Store.setDatabaseService(this.databaseService);
@@ -59,6 +61,14 @@ export class SubmissionsService {
     if (!submission) return null;
     const populatedSubmissions = await this.populateSubmissionRelations([submission]);
     return populatedSubmissions[0];
+  }
+
+  private enrichUploadWithUrls(upload: any): any {
+    return {
+      ...upload,
+      imageSrc: this.storageService.getPublicUrl('submissions/' + upload.filename),
+      imageDownloadUrl: this.storageService.getPublicUrl('submissions/' + upload.filename, true),
+    };
   }
 
   private async populateSubmissionRelations(submissions: SubmissionData[]): Promise<any[]> {
@@ -115,29 +125,50 @@ export class SubmissionsService {
       }
       
       // Populate uploads relation
- 
       if ((submission as any)?.upload_ids && (submission as any).upload_ids.length > 0) {
         try {
-          //fetch uploads that has submissionId
-          const uploads = await Upload.findAllByFilter({
-            submissionId: submission.id
-          }) as any[]
-         
-          // Add imageSrc to each upload
-          const uploadsWithImageSrc = uploads.map((upload: any) => ({
-            ...upload,
-            imageSrc: this.storageService.getPublicUrl('submissions/' + upload.filename),
-            imageDownloadUrl: this.storageService.getPublicUrl('submissions/' + upload.filename, true)
-          }));
-          
-          populatedSubmission.uploads = uploadsWithImageSrc
+          const uploads = (await Upload.findAllByFilter({
+            submissionId: submission.id,
+          })) as any[];
+
+          populatedSubmission.uploads = uploads.map((upload: any) =>
+            this.enrichUploadWithUrls(upload),
+          );
         } catch (error) {
           populatedSubmission.uploads = [];
         }
       } else {
         populatedSubmission.uploads = [];
       }
-      
+
+      // Populate bays (ordered by submission.bay_ids) with nested uploads
+      const bayIds: string[] = (submission as any).bay_ids || [];
+      if (bayIds.length > 0) {
+        try {
+          const baysOut: any[] = [];
+          for (const bayId of bayIds) {
+            const bayRow: any = await Bay.findById(bayId);
+            if (!bayRow) continue;
+
+            const uploadIdsInBay: string[] = bayRow.upload_ids || [];
+            const bayUploads: any[] = [];
+            for (const uploadId of uploadIdsInBay) {
+              const u = (await Upload.findById(uploadId)) as any;
+              if (u) bayUploads.push(this.enrichUploadWithUrls(u));
+            }
+            baysOut.push({
+              ...bayRow,
+              uploads: bayUploads,
+            });
+          }
+          populatedSubmission.bays = baysOut;
+        } catch (error) {
+          populatedSubmission.bays = [];
+        }
+      } else {
+        populatedSubmission.bays = [];
+      }
+
       populatedSubmissions.push(populatedSubmission);
     }
     
@@ -159,7 +190,7 @@ export class SubmissionsService {
     data: SubmissionData,
     file: Express.Multer.File,
     uploadedById: string
-  ): Promise<{ submission: SubmissionData; upload: UploadData }> {
+  ): Promise<{ submission: SubmissionData; upload: UploadData; bay: BayData }> {
     // Upload file to storage first
     const uploadedFile = await this.storageService.uploadFile(file, 'submissions');
     console.log('uploadedFile', uploadedFile);
@@ -196,13 +227,21 @@ export class SubmissionsService {
     // Update upload with submission ID
     uploadData.submissionId = submission.id;
     const upload = await Upload.create(uploadData) as UploadData;
-    
-    // Update submission with upload ID
+
+    const bayId = uuidv4();
+    const bay = (await Bay.create({
+      id: bayId,
+      uploadIds: [upload.id],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })) as BayData;
+
     const updatedSubmission = await Submission.update(submission?.id || '', {
-      uploadIds: [upload.id]
+      uploadIds: [upload.id],
+      bayIds: [bayId],
     }) as SubmissionData;
 
-    return { submission: updatedSubmission, upload };
+    return { submission: updatedSubmission, upload, bay };
   }
 
   async addUploadToSubmission(
@@ -233,6 +272,81 @@ export class SubmissionsService {
     // Update submission with new upload ID
     const updatedUploadIds = [...(submission.uploadIds || []), uploadId];
     return Submission.update(submissionId, { uploadIds: updatedUploadIds }) as Promise<SubmissionData>;
+  }
+
+  async addUploadToBayOrCreate(
+    submissionId: string,
+    bayId: string | undefined,
+    file: Express.Multer.File,
+    uploadedById: string,
+  ): Promise<{ submission: SubmissionData; bay: BayData; upload: UploadData }> {
+    const submission: any = (await Submission.findById(submissionId)) as SubmissionData;
+    if (!submission) {
+      throw new Error('Submission not found');
+    }
+
+    const upload = (await this.createUpload(
+      {
+        storeId: submission.store_id,
+        planogramId: submission.planogram_id,
+        submissionId,
+      },
+      file,
+      uploadedById,
+    )) as UploadData;
+
+    // Keep backward compatibility: also attach the upload to the submission.
+    const currentSubmissionUploadIds: string[] = submission.upload_ids || [];
+    const updatedSubmissionUploadIds = Array.from(
+      new Set([...(currentSubmissionUploadIds || []), upload.id]),
+    );
+
+    let updatedSubmission = (await Submission.update(submissionId, {
+      uploadIds: updatedSubmissionUploadIds,
+    })) as SubmissionData;
+
+    const currentBayIds: string[] = submission.bay_ids || [];
+
+    // Add to existing bay or create a new one.
+    if (bayId) {
+      if (!currentBayIds.includes(bayId)) {
+        throw new Error('Bay does not belong to this submission');
+      }
+
+      const bay: any = (await Bay.findById(bayId)) as BayData;
+      if (!bay) {
+        throw new Error('Bay not found');
+      }
+
+      const currentBayUploadIds: string[] = bay.upload_ids || [];
+      const updatedBayUploadIds = Array.from(
+        new Set([...(currentBayUploadIds || []), upload.id]),
+      );
+
+      const updatedBay = (await Bay.update(bayId, {
+        uploadIds: updatedBayUploadIds,
+      })) as BayData;
+
+      return { submission: updatedSubmission, bay: updatedBay, upload };
+    }
+
+    const newBayId = uuidv4();
+    const newBay = (await Bay.create({
+      id: newBayId,
+      uploadIds: [upload.id],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })) as BayData;
+
+    const updatedBayIds = Array.from(
+      new Set([...(currentBayIds || []), newBayId]),
+    );
+
+    updatedSubmission = (await Submission.update(submissionId, {
+      bayIds: updatedBayIds,
+    })) as SubmissionData;
+
+    return { submission: updatedSubmission, bay: newBay, upload };
   }
 
   async createUpload(

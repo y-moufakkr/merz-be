@@ -21,6 +21,7 @@ import { RolesGuard } from '../auth/roles.guard';
 import { CreateSubmissionDto } from './dto/create-submission.dto';
 import { UpdateSubmissionDto } from './dto/update-submission.dto';
 import { AddUploadToSubmissionDto } from './dto/add-upload-to-submission.dto';
+import { AddUploadToBayDto } from './dto/add-upload-to-bay.dto';
 import { UploadData } from './upload.entity';
 
 @ApiTags('submissions')
@@ -129,6 +130,39 @@ export class SubmissionsController {
 
     // Then add it to the submission
     return this.submissionsService.addUploadToSubmission(submissionId, upload?.id);
+  }
+
+  @Post(':id/bays/uploads')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @ApiBearerAuth()
+  @Roles('USER', 'ADMIN')
+  @ApiOperation({ summary: 'Add upload to a bay (or create bay) within a submission' })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('file'))
+  @ApiParam({ name: 'id', type: String })
+  @ApiBody({
+    description: 'Add file upload to a bay. Provide bayId to attach to an existing bay, or omit to create a new bay.',
+    schema: {
+      type: 'object',
+      properties: {
+        bayId: { type: 'string', format: 'uuid' },
+        file: { type: 'string', format: 'binary' },
+      },
+      required: ['file'],
+    },
+  })
+  async addUploadToBayOrCreate(
+    @Param('id') submissionId: string,
+    @Body() body: AddUploadToBayDto,
+    @Req() req,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    return this.submissionsService.addUploadToBayOrCreate(
+      submissionId,
+      body?.bayId,
+      file,
+      req.user?.id,
+    );
   }
 
   @Put(':id')

@@ -14,6 +14,7 @@ export interface SubmissionData {
   storeId?: string;
   planogramId?: string;
   uploadIds?: string[];
+  bayIds?: string[];
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -38,6 +39,9 @@ export class Submission extends BaseEntity {
 
   @Column({ name: 'upload_ids', type: 'json' })
   uploadIds: string[];
+
+  @Column({ name: 'bay_ids', type: 'json', nullable: true })
+  bayIds?: string[];
 
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
